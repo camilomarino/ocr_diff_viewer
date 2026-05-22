@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OCR Diff Viewer</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1 id="appTitle">OCR Diff Viewer</h1>
+        <p id="datasetSummary">Loading index...</p>
+      </div>
+      <button id="homeButton" class="home-button" type="button">Summary</button>
+    </header>
+
+    <main id="homeView" class="home-view hidden">
+      <section class="home-head">
+        <div class="home-actions">
+          <button id="sortModelsAlpha" class="subtle-button" type="button" title="Sort models alphabetically">Sort Models A-Z</button>
+          <button id="sortDocsAlpha" class="subtle-button" type="button" title="Sort documents alphabetically">Sort Docs A-Z</button>
+        </div>
+        <div class="home-controls">
+          <input id="homeDocSearch" type="search" autocomplete="off" placeholder="Document regex or text">
+          <input id="homeModelSearch" type="search" autocomplete="off" placeholder="Model regex or text">
+        </div>
+      </section>
+      <section class="summary-table-wrap">
+        <table id="summaryTable" class="summary-table"></table>
+      </section>
+    </main>
+
+    <main id="detailView" class="layout hidden">
+      <aside class="sidebar" id="sidebar">
+        <button id="sidebarToggle" class="sidebar-toggle" title="Collapse panel" aria-label="Collapse panel" aria-expanded="true">‹</button>
+        <div id="sidebarResizer" class="sidebar-resizer" title="Resize panel" role="separator" aria-orientation="vertical"></div>
+        <div class="sidebar-content">
+        <section class="panel">
+          <label for="docSearch">Document</label>
+          <input id="docSearch" type="search" autocomplete="off" placeholder="Regex or text">
+          <select id="docSelect" size="12" aria-label="Documents"></select>
+        </section>
+
+        <section class="panel">
+          <label for="modelSearch">Model</label>
+          <input id="modelSearch" type="search" autocomplete="off" placeholder="Regex or text">
+          <select id="modelSelect" size="10" aria-label="Models"></select>
+        </section>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <section class="document-strip">
+          <div>
+            <span class="eyebrow">Page</span>
+            <strong id="pageTitle">-</strong>
+          </div>
+          <div class="metrics" id="selectedMetrics"></div>
+        </section>
+
+        <section class="comparison-grid">
+          <section id="imagePanel" class="viewer-section image-section grid-cell">
+            <div class="section-head">
+              <h2>Image</h2>
+              <div class="zoom-controls">
+                <button id="zoomOut" class="icon-button" title="Zoom out" aria-label="Zoom out">−</button>
+                <input id="zoomRange" type="range" min="25" max="500" value="100" aria-label="Zoom">
+                <button id="zoomIn" class="icon-button" title="Zoom in" aria-label="Zoom in">+</button>
+              </div>
+            </div>
+            <div class="image-frame" id="imageFrame">
+              <img id="pageImage" alt="">
+            </div>
+          </section>
+
+          <section id="diffPanel" class="viewer-section grid-cell">
+            <div class="section-head">
+              <h2>Differences</h2>
+              <select id="diffCriterionSelect" class="diff-criterion-select" aria-label="Difference criterion">
+                <option value="cer">CER criterion</option>
+                <option value="wer">WER criterion</option>
+              </select>
+            </div>
+            <div class="diff-toolbar">
+              <div id="diffSummary" class="diff-summary"></div>
+            </div>
+            <pre id="diffText" class="diff"></pre>
+          </section>
+
+          <section id="gtPanel" class="viewer-section grid-cell text-pane">
+            <div class="section-head">
+              <h2>Ground truth</h2>
+              <button id="copyGt" class="icon-button" title="Copy ground truth" aria-label="Copy ground truth">⧉</button>
+            </div>
+            <pre id="groundTruthText"></pre>
+          </section>
+
+          <section id="ocrPanel" class="viewer-section grid-cell text-pane">
+            <div class="section-head">
+              <h2 id="ocrTitle">OCR</h2>
+              <button id="copyOcr" class="icon-button" title="Copy OCR" aria-label="Copy OCR">⧉</button>
+            </div>
+            <pre id="ocrText"></pre>
+          </section>
+
+          <div id="verticalSplitter" class="grid-splitter vertical" title="Resize columns" role="separator" aria-orientation="vertical"></div>
+          <div id="horizontalSplitter" class="grid-splitter horizontal" title="Resize rows" role="separator" aria-orientation="horizontal"></div>
+        </section>
+      </section>
+    </main>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script src="data/data.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

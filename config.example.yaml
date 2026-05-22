@@ -1,0 +1,34 @@
+# Generic OCR diff viewer input.
+#
+# Matching is done by filename stem:
+#   images/page_001.png
+#   ground_truth/page_001.txt
+#   transcriptions/model_a/page_001.txt
+#
+# transcriptions_dir can be either:
+#   - flat: transcriptions/page_001.txt
+#   - grouped by model: transcriptions/model_a/page_001.txt
+#
+# Fast UI-only rebuilds are controlled with CLI flags:
+#   python build_static_viewer.py --config config.example.yaml --front-only
+#   python build_static_viewer.py --config config.example.yaml --reuse-index
+
+dataset_name: example_dataset
+images_dir: /absolute/path/to/images
+ground_truth_dir: /absolute/path/to/ground_truth_txt
+transcriptions_dir: /absolute/path/to/transcriptions_txt_or_model_dirs
+output_dir: ./output
+
+# Used only when transcriptions_dir is flat.
+default_model_name: ocr_prediction
+
+# Optional: use existing benchmark metrics instead of only metrics computed
+# directly from the raw text files. CSV columns:
+# page_id,model,cer,wer,gt_chars,pred_chars,gt_words,pred_words
+# metrics_csv:
+#   - /absolute/path/to/metrics.csv
+
+# Optional: map output folder names to model IDs in metrics_csv.
+# model_aliases:
+#   gpt_5_5: gpt-5.5
+#   claude_opus_4_7: claude-opus-4-7
