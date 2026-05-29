@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import mimetypes
+import re
 import shutil
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -31,6 +33,7 @@ IMAGE_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
+EXTERNAL_RESULT_METADATA_KEYS = {"latencySeconds", "costUsd"}
 
 
 def read_config(path: Path) -> dict[str, Any]:
@@ -72,8 +75,63 @@ def cfg_paths(config: dict[str, Any], key: str) -> list[Path]:
     raise ValueError(f"{key} must be a string path or a list of paths.")
 
 
+def strip_markdown_table_separators(text: str) -> str:
+    separator_pattern = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+    return "\n".join(line for line in text.split("\n") if not separator_pattern.match(line))
+
+
+def strip_structural_lines(text: str) -> str:
+    structural_pattern = re.compile(r"^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$")
+    return "\n".join(line for line in text.split("\n") if not structural_pattern.match(line))
+
+
+def strip_markdown_emphasis(text: str) -> str:
+    text = re.sub(r"(?<!\*)\*\*([^*\n]+)\*\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!_)__([^_\n]+)__(?!_)", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
+    return re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
+
+
+def replace_layout_separators(text: str) -> str:
+    return "\n".join(re.sub(r"\s*\|\s*", " ", line) if "|" in line else line for line in text.split("\n"))
+
+
+def normalize_blank_lines(text: str) -> str:
+    normalized = []
+    previous_blank = False
+    for line in text.split("\n"):
+        trimmed_right = re.sub(r"\s+$", "", line)
+        blank = not trimmed_right.strip()
+        if blank and previous_blank:
+            continue
+        normalized.append(trimmed_right)
+        previous_blank = blank
+    return "\n".join(normalized)
+
+
+def cleanup_reading_text(text: str) -> str:
+    cleaned = html.unescape(text.replace("\r\n", "\n").replace("\r", "\n"))
+    cleaned = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", cleaned)
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", cleaned)
+    cleaned = re.sub(r"^\s*`{3,}.*$", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"^\s{0,3}#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"^\s{0,3}>\s?", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"^[ \t]*(?:[-*+\u2022\u00b7][ \t]+)+", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"<img\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<[^>\n]+>", "", cleaned)
+    cleaned = cleaned.replace("#", "")
+    cleaned = strip_markdown_table_separators(cleaned)
+    cleaned = strip_markdown_emphasis(cleaned)
+    cleaned = strip_structural_lines(cleaned)
+    cleaned = replace_layout_separators(cleaned)
+    return normalize_blank_lines(cleaned).strip()
+
+
 def normalize_for_eval(text: str) -> str:
-    return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")).strip()
+    cleaned = cleanup_reading_text(text)
+    if not cleaned:
+        return ""
+    return "\n".join(re.sub(r"[ \t\f\v]+", " ", line).strip() for line in cleaned.split("\n")).strip()
 
 
 def text_metrics(reference: str, hypothesis: str) -> dict[str, float | int | None]:
@@ -256,6 +314,7 @@ def build_index(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             "imageMime": mimetypes.guess_type(images[page_id].name)[0] or "",
             "groundTruth": "",
             "groundTruthText": reference_raw,
+            "groundTruthScoringText": reference_eval,
             "models": {},
         }
         for model_id, prediction_paths in predictions_by_model.items():
@@ -266,10 +325,18 @@ def build_index(config: dict[str, Any], output_dir: Path) -> dict[str, Any]:
             hypothesis_eval = normalize_for_eval(prediction_raw)
             metrics = text_metrics(reference_raw, prediction_raw)
             canonical_model = model_aliases.get(model_id, model_id)
-            metrics.update({key: value for key, value in canonical_metrics.get((page_id, canonical_model), {}).items() if value is not None})
+            external_metrics = canonical_metrics.get((page_id, canonical_model), {})
+            metrics.update(
+                {
+                    key: value
+                    for key, value in external_metrics.items()
+                    if key in EXTERNAL_RESULT_METADATA_KEYS and value is not None
+                }
+            )
             page["models"][model_id] = {
                 "text": "",
                 "textContent": prediction_raw,
+                "scoringTextContent": hypothesis_eval,
                 "ops": edit_operation_counts(reference_eval, hypothesis_eval),
                 "wordOps": word_operation_counts(reference_eval, hypothesis_eval),
                 "wordOpcodes": word_opcodes(reference_eval, hypothesis_eval),

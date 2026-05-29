@@ -21,13 +21,22 @@
         <div class="home-actions">
           <button id="sortModelsAlpha" class="subtle-button" type="button" title="Sort models alphabetically">Sort Models A-Z</button>
           <button id="sortDocsAlpha" class="subtle-button" type="button" title="Sort documents alphabetically">Sort Docs A-Z</button>
+          <div class="summary-column-toggles" aria-label="Summary columns">
+            <button class="subtle-button column-toggle" type="button" data-summary-column="cer" aria-pressed="true" title="Toggle CER columns">CER</button>
+            <button class="subtle-button column-toggle" type="button" data-summary-column="wer" aria-pressed="true" title="Toggle WER columns">WER</button>
+            <button class="subtle-button column-toggle" type="button" data-summary-column="insertions" aria-pressed="false" title="Toggle insertion columns">Ins</button>
+            <button class="subtle-button column-toggle" type="button" data-summary-column="deletions" aria-pressed="false" title="Toggle deletion columns">Del</button>
+            <button class="subtle-button column-toggle" type="button" data-summary-column="substitutions" aria-pressed="false" title="Toggle substitution columns">Sub</button>
+          </div>
         </div>
         <div class="home-controls">
           <input id="homeDocSearch" type="search" autocomplete="off" placeholder="Document regex or text">
           <input id="homeModelSearch" type="search" autocomplete="off" placeholder="Model regex or text">
+          <button id="summaryLegendToggle" class="subtle-button summary-legend-toggle" type="button" aria-expanded="false" title="Show color range thresholds">Ranges</button>
         </div>
       </section>
       <section class="summary-table-wrap">
+        <div id="summaryLegendPanel" class="summary-legend-panel hidden"></div>
         <table id="summaryTable" class="summary-table"></table>
       </section>
     </main>
@@ -36,18 +45,20 @@
       <aside class="sidebar" id="sidebar">
         <button id="sidebarToggle" class="sidebar-toggle" title="Collapse panel" aria-label="Collapse panel" aria-expanded="true">‹</button>
         <div id="sidebarResizer" class="sidebar-resizer" title="Resize panel" role="separator" aria-orientation="vertical"></div>
-        <div class="sidebar-content">
-        <section class="panel">
-          <label for="docSearch">Document</label>
-          <input id="docSearch" type="search" autocomplete="off" placeholder="Regex or text">
-          <select id="docSelect" size="12" aria-label="Documents"></select>
-        </section>
+        <div class="sidebar-content" id="sidebarContent">
+          <section class="panel sidebar-panel" id="documentPanel">
+            <label for="docSearch">Document</label>
+            <input id="docSearch" type="search" autocomplete="off" placeholder="Regex or text">
+            <select id="docSelect" size="12" aria-label="Documents"></select>
+          </section>
 
-        <section class="panel">
-          <label for="modelSearch">Model</label>
-          <input id="modelSearch" type="search" autocomplete="off" placeholder="Regex or text">
-          <select id="modelSelect" size="10" aria-label="Models"></select>
-        </section>
+          <div id="sidebarPanelSplitter" class="sidebar-panel-splitter" title="Resize document and model lists" role="separator" aria-orientation="horizontal" aria-valuemin="20" aria-valuemax="80" aria-valuenow="50"></div>
+
+          <section class="panel sidebar-panel" id="modelPanel">
+            <label for="modelSearch">Model</label>
+            <input id="modelSearch" type="search" autocomplete="off" placeholder="Regex or text">
+            <select id="modelSelect" size="10" aria-label="Models"></select>
+          </section>
         </div>
       </aside>
 
@@ -92,7 +103,10 @@
           <section id="gtPanel" class="viewer-section grid-cell text-pane">
             <div class="section-head">
               <h2>Ground truth</h2>
-              <button id="copyGt" class="icon-button" title="Copy ground truth" aria-label="Copy ground truth">⧉</button>
+              <div class="text-pane-actions">
+                <button class="subtle-button text-view-toggle" type="button" title="Show raw text panes" aria-pressed="false">Norm</button>
+                <button id="copyGt" class="icon-button" title="Copy ground truth" aria-label="Copy ground truth">⧉</button>
+              </div>
             </div>
             <pre id="groundTruthText"></pre>
           </section>
@@ -100,7 +114,10 @@
           <section id="ocrPanel" class="viewer-section grid-cell text-pane">
             <div class="section-head">
               <h2 id="ocrTitle">OCR</h2>
-              <button id="copyOcr" class="icon-button" title="Copy OCR" aria-label="Copy OCR">⧉</button>
+              <div class="text-pane-actions">
+                <button class="subtle-button text-view-toggle" type="button" title="Show raw text panes" aria-pressed="false">Norm</button>
+                <button id="copyOcr" class="icon-button" title="Copy OCR" aria-label="Copy OCR">⧉</button>
+              </div>
             </div>
             <pre id="ocrText"></pre>
           </section>

@@ -79,6 +79,23 @@ model_aliases:
   folder_name: report_model_id
 ```
 
+The viewer always computes CER, WER, character counts, word counts, and edit
+operations from its normalized evaluation text. `metrics_csv` can add external
+metadata such as latency and cost, but it does not override the viewer's text
+metrics.
+
+## Evaluation Text
+
+Metrics computed by this viewer use a reading-order normalization before CER,
+WER, and edit-operation counts are calculated. The builder removes common
+Markdown/HTML/layout artifacts such as headings, table separators, emphasis,
+links, bullets, tags, and pipe separators, then normalizes whitespace. The
+side-by-side text panes show this normalized text by default, with a small
+toggle to inspect the raw ground-truth and OCR text when needed.
+
+If you provide `metrics_csv`, those external values do not override the
+computed CER/WER values.
+
 ## Build
 
 ```bash

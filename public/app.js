@@ -7,20 +7,41 @@ const state = {
   currentResult: null,
   gtText: "",
   ocrText: "",
+  gtScoringText: "",
+  ocrScoringText: "",
+  textView: "normalized",
   zoom: 100,
   gridLeft: 50,
   gridTop: 50,
   sidebarWidth: 300,
+  sidebarPanelSplit: 50,
   summaryModelWidth: 360,
   syncingScroll: false,
   scrollSource: "gt",
   homeSort: { type: "aggregate", metric: "cerMedian", pageId: null, direction: "asc" },
   homePageSort: { type: "alpha", modelId: null, metric: "cer", direction: "asc" },
+  summaryColumns: ["cer", "wer"],
+  summaryLegendOpen: false,
   diffCriterion: "cer",
   appliedRouteHash: "",
 };
 
 const horizontalBounceTimers = new WeakMap();
+const SUMMARY_DOCUMENT_METRICS = [
+  { id: "cer", label: "CER", title: "Character error rate", colorFamily: "error" },
+  { id: "wer", label: "WER", title: "Word error rate", colorFamily: "error" },
+  { id: "insertions", label: "Ins", title: "Inserted characters", colorFamily: "error" },
+  { id: "deletions", label: "Del", title: "Deleted characters", colorFamily: "error" },
+  { id: "substitutions", label: "Sub", title: "Substituted characters", colorFamily: "error" },
+];
+const SUMMARY_COLOR_RANGES = [
+  { className: "error-excellent", label: "p0-p10", title: "Excellent: lowest 10%" },
+  { className: "error-good", label: "p10-p25", title: "Good: 10th to 25th percentile" },
+  { className: "error-neutral", label: "p25-p75", title: "Typical: 25th to 75th percentile" },
+  { className: "error-weak", label: "p75-p90", title: "Weak: 75th to 90th percentile" },
+  { className: "error-bad", label: "p90-p97", title: "Bad: 90th to 97th percentile" },
+  { className: "error-worst", label: "p97-p100", title: "Worst: top 3%" },
+];
 
 const els = {
   appTitle: document.getElementById("appTitle"),
@@ -32,12 +53,16 @@ const els = {
   homeModelSearch: document.getElementById("homeModelSearch"),
   sortModelsAlpha: document.getElementById("sortModelsAlpha"),
   sortDocsAlpha: document.getElementById("sortDocsAlpha"),
+  summaryColumnToggles: document.querySelectorAll(".column-toggle"),
   summaryTable: document.getElementById("summaryTable"),
+  summaryLegendToggle: document.getElementById("summaryLegendToggle"),
+  summaryLegendPanel: document.getElementById("summaryLegendPanel"),
   docSearch: document.getElementById("docSearch"),
   docSelect: document.getElementById("docSelect"),
   modelSearch: document.getElementById("modelSearch"),
   modelSelect: document.getElementById("modelSelect"),
   pageTitle: document.getElementById("pageTitle"),
+  textViewToggles: document.querySelectorAll(".text-view-toggle"),
   selectedMetrics: document.getElementById("selectedMetrics"),
   pageImage: document.getElementById("pageImage"),
   groundTruthText: document.getElementById("groundTruthText"),
@@ -55,6 +80,8 @@ const els = {
   horizontalSplitter: document.getElementById("horizontalSplitter"),
   sidebarToggle: document.getElementById("sidebarToggle"),
   sidebarResizer: document.getElementById("sidebarResizer"),
+  sidebarContent: document.getElementById("sidebarContent"),
+  sidebarPanelSplitter: document.getElementById("sidebarPanelSplitter"),
 };
 
 function formatPercent(value) {
@@ -69,6 +96,11 @@ function formatCompactPercent(value) {
   return typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "-";
 }
 
+function formatCount(value) {
+  if (typeof value !== "number") return "-";
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
 function resultCer(result) {
   if (typeof result?.cer === "number") return result.cer;
   if (typeof result?.ops?.editDistance === "number" && result.ops.scoringGtChars > 0) {
@@ -79,6 +111,16 @@ function resultCer(result) {
 
 function resultWer(result) {
   return typeof result?.wer === "number" ? result.wer : null;
+}
+
+function resultOperation(result, metric) {
+  const value = result?.ops?.[metric];
+  return typeof value === "number" ? value : null;
+}
+
+function resultScoringGtChars(result) {
+  const value = result?.ops?.scoringGtChars ?? result?.gtChars;
+  return typeof value === "number" && value > 0 ? value : null;
 }
 
 function resultGtChars(result) {
@@ -100,9 +142,8 @@ function modelAvgWer(modelId, fallbackValue) {
 }
 
 function modelMetricValues(modelId, metric) {
-  const getter = metric === "wer" ? resultWer : resultCer;
   return state.pages
-    .map((page) => getter(page.models[modelId]))
+    .map((page) => resultMetric(page.models[modelId], metric))
     .filter((value) => typeof value === "number");
 }
 
@@ -120,49 +161,291 @@ function median(values) {
 }
 
 function modelSummaryMetric(model, metric) {
-  if (metric === "cerMean") return model.displayCerMean;
-  if (metric === "cerMedian") return model.displayCerMedian;
-  if (metric === "werMean") return model.displayWerMean;
-  if (metric === "werMedian") return model.displayWerMedian;
-  return null;
+  const aggregate = parseAggregateMetric(metric);
+  if (!aggregate) return null;
+  if (aggregate.sourceMetric === "cer" && aggregate.statistic === "mean" && typeof model.avgCer === "number") {
+    return model.avgCer;
+  }
+  if (aggregate.sourceMetric === "wer" && aggregate.statistic === "mean" && typeof model.avgWer === "number") {
+    return model.avgWer;
+  }
+  const values = modelMetricValues(model.id, aggregate.sourceMetric);
+  return aggregate.statistic === "mean" ? mean(values) : median(values);
 }
 
 function selectedDocSortMetric() {
-  return "cer";
+  return selectedSummaryMetricIds()[0] || "cer";
 }
 
 function resultMetric(result, metric) {
-  return metric === "wer" ? resultWer(result) : resultCer(result);
+  if (metric === "cer") return resultCer(result);
+  if (metric === "wer") return resultWer(result);
+  return resultOperation(result, metric);
+}
+
+function summaryMetricDefinition(metric) {
+  return SUMMARY_DOCUMENT_METRICS.find((column) => column.id === metric);
+}
+
+function metricColorFamily(metric) {
+  return summaryMetricDefinition(metric)?.colorFamily || "error";
+}
+
+function selectedSummaryMetricIds() {
+  return SUMMARY_DOCUMENT_METRICS
+    .map((column) => column.id)
+    .filter((metric) => state.summaryColumns.includes(metric));
+}
+
+function selectedSummaryMetrics() {
+  return SUMMARY_DOCUMENT_METRICS.filter((column) => state.summaryColumns.includes(column.id));
+}
+
+function selectedAggregateColumns() {
+  return selectedSummaryMetrics().flatMap((column) => [
+    {
+      metric: `${column.id}Mean`,
+      sourceMetric: column.id,
+      group: column.label,
+      label: "Mean",
+      statistic: "mean",
+    },
+    {
+      metric: `${column.id}Median`,
+      sourceMetric: column.id,
+      group: column.label,
+      label: "Median",
+      statistic: "median",
+    },
+  ]);
+}
+
+function parseAggregateMetric(metric) {
+  const statistic = metric.endsWith("Mean") ? "mean" : metric.endsWith("Median") ? "median" : null;
+  if (!statistic) return null;
+  const suffixLength = statistic === "mean" ? "Mean".length : "Median".length;
+  const sourceMetric = metric.slice(0, -suffixLength);
+  if (!summaryMetricDefinition(sourceMetric)) return null;
+  return { sourceMetric, statistic };
+}
+
+function summaryMetricLabel(metric) {
+  return summaryMetricDefinition(metric)?.label || metric.toUpperCase();
+}
+
+function formatSummaryMetric(metric, value, compact = true) {
+  if (metric === "cer" || metric === "wer") {
+    return compact ? formatCompactPercent(value) : formatPercent(value);
+  }
+  return formatCount(value);
+}
+
+function documentColorValue(result, metric) {
+  const value = resultMetric(result, metric);
+  if (typeof value !== "number") return null;
+  if (metricColorFamily(metric) !== "operation") return value;
+  const denominator = resultScoringGtChars(result);
+  return denominator ? value / denominator : null;
+}
+
+function sortedMetricValues(values) {
+  return values.filter((value) => typeof value === "number" && Number.isFinite(value)).sort((a, b) => a - b);
+}
+
+function percentileRank(sortedValues, value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || !sortedValues.length) return null;
+  if (sortedValues.length === 1) return 0.5;
+  let lower = 0;
+  while (lower < sortedValues.length && sortedValues[lower] < value) lower += 1;
+  let upper = lower;
+  while (upper < sortedValues.length && sortedValues[upper] === value) upper += 1;
+  if (upper === lower) return lower / (sortedValues.length - 1);
+  const averageRank = (lower + upper - 1) / 2;
+  return averageRank / (sortedValues.length - 1);
+}
+
+function percentileValue(sortedValues, percentile) {
+  if (!sortedValues.length) return null;
+  if (sortedValues.length === 1) return sortedValues[0];
+  const position = (percentile / 100) * (sortedValues.length - 1);
+  const lowerIndex = Math.floor(position);
+  const upperIndex = Math.ceil(position);
+  if (lowerIndex === upperIndex) return sortedValues[lowerIndex];
+  const weight = position - lowerIndex;
+  return sortedValues[lowerIndex] * (1 - weight) + sortedValues[upperIndex] * weight;
+}
+
+function percentileTone(percentile) {
+  if (percentile === null) return "missing";
+  if (percentile <= 0.10) return "excellent";
+  if (percentile <= 0.25) return "good";
+  if (percentile < 0.75) return "neutral";
+  if (percentile < 0.90) return "weak";
+  if (percentile < 0.97) return "bad";
+  return "worst";
+}
+
+function percentileMetricClass(metric, value, scale) {
+  if (typeof value !== "number" || !scale?.length) return "missing";
+  const family = metricColorFamily(metric);
+  return `percentile-cell ${family}-percentile ${family}-${percentileTone(percentileRank(scale, value))}`;
+}
+
+function formatLegendValue(metric, value) {
+  if (typeof value !== "number") return "-";
+  if (metric === "cer" || metric === "wer") return `${(value * 100).toFixed(1)}%`;
+  return value.toFixed(1);
+}
+
+function colorRangeThresholds(metric, scale) {
+  const p10 = percentileValue(scale, 10);
+  const p25 = percentileValue(scale, 25);
+  const p75 = percentileValue(scale, 75);
+  const p90 = percentileValue(scale, 90);
+  const p97 = percentileValue(scale, 97);
+  return [
+    `<= ${formatLegendValue(metric, p10)}`,
+    `${formatLegendValue(metric, p10)}-${formatLegendValue(metric, p25)}`,
+    `${formatLegendValue(metric, p25)}-${formatLegendValue(metric, p75)}`,
+    `${formatLegendValue(metric, p75)}-${formatLegendValue(metric, p90)}`,
+    `${formatLegendValue(metric, p90)}-${formatLegendValue(metric, p97)}`,
+    `>= ${formatLegendValue(metric, p97)}`,
+  ];
+}
+
+function renderThresholdLine(label, metric, scale) {
+  if (!scale?.length) return "";
+  const thresholds = colorRangeThresholds(metric, scale)
+    .map(
+      (value, index) =>
+        `<span class="summary-threshold-value percentile-cell ${SUMMARY_COLOR_RANGES[index].className}" role="cell">${escapeHtml(value)}</span>`
+    )
+    .join("");
+  return (
+    `<div class="summary-threshold-line" role="row">` +
+    `<span class="summary-threshold-label">${escapeHtml(label)}</span>` +
+    thresholds +
+    `</div>`
+  );
+}
+
+function buildDocumentColorScales(columns) {
+  const scales = {};
+  columns.forEach((column) => {
+    scales[column.id] = sortedMetricValues(
+      state.pages.flatMap((page) =>
+        Object.values(page.models).map((result) => documentColorValue(result, column.id))
+      )
+    );
+  });
+  return scales;
+}
+
+function buildAggregateColorScales(models, columns) {
+  const scales = {};
+  columns.forEach((column) => {
+    scales[column.metric] = sortedMetricValues(models.map((model) => modelSummaryMetric(model, column.metric)));
+  });
+  return scales;
+}
+
+function summaryMetricTitle(modelId, pageId, result) {
+  const lines = [`${modelId} / ${pageId}`];
+  SUMMARY_DOCUMENT_METRICS.forEach((column) => {
+    const value = resultMetric(result, column.id);
+    const rate = documentColorValue(result, column.id);
+    const rateText = column.colorFamily === "operation" && typeof rate === "number" ? ` · rate ${formatPercent(rate)}` : "";
+    lines.push(`${column.label} ${formatSummaryMetric(column.id, value, false)}${rateText}`);
+  });
+  return lines.join("\n");
+}
+
+function updateSummaryColumnToggles() {
+  els.summaryColumnToggles.forEach((toggle) => {
+    toggle.setAttribute("aria-pressed", String(state.summaryColumns.includes(toggle.dataset.summaryColumn)));
+  });
+}
+
+function renderSummaryColorLegend(documentColumns, aggregateColumns, documentColorScales, aggregateColorScales) {
+  const documentThresholds = documentColumns
+    .map((column) => renderThresholdLine(`${column.label} docs`, column.id, documentColorScales[column.id]))
+    .join("");
+  const aggregateThresholds = aggregateColumns
+    .map((column) => renderThresholdLine(`${column.group} ${column.label}`, column.sourceMetric, aggregateColorScales[column.metric]))
+    .join("");
+  const header = (
+    `<div class="summary-threshold-line summary-threshold-header" role="row">` +
+    `<span class="summary-threshold-label"></span>` +
+    SUMMARY_COLOR_RANGES.map((range) => `<span class="summary-threshold-heading">${range.label}</span>`).join("") +
+    `</div>`
+  );
+  return (
+    `<div class="summary-thresholds" role="table">${header}${documentThresholds}${aggregateThresholds}</div>`
+  );
+}
+
+function ensureVisibleSummarySorts() {
+  const selected = selectedSummaryMetricIds();
+  const aggregateMetrics = selectedAggregateColumns().map((column) => column.metric);
+  if (state.homeSort.type === "aggregate" && !aggregateMetrics.includes(state.homeSort.metric)) {
+    state.homeSort = aggregateMetrics.length
+      ? { type: "aggregate", metric: aggregateMetrics[0], pageId: null, direction: "asc" }
+      : { type: "alpha", metric: null, pageId: null, direction: "asc" };
+  }
+  if (state.homeSort.type === "page" && (!selected.length || !selected.includes(state.homeSort.metric))) {
+    state.homeSort = aggregateMetrics.length
+      ? { type: "aggregate", metric: aggregateMetrics[0], pageId: null, direction: "asc" }
+      : { type: "alpha", metric: null, pageId: null, direction: "asc" };
+  }
+  if (state.homePageSort.type === "model" && (!selected.length || !selected.includes(state.homePageSort.metric))) {
+    state.homePageSort = { type: "alpha", modelId: null, metric: selectedDocSortMetric(), direction: "asc" };
+  }
+}
+
+function toggleSummaryColumn(metric) {
+  const next = new Set(state.summaryColumns);
+  if (next.has(metric)) {
+    next.delete(metric);
+  } else {
+    next.add(metric);
+  }
+  state.summaryColumns = SUMMARY_DOCUMENT_METRICS.map((column) => column.id).filter((columnId) => next.has(columnId));
+  renderHomeTable();
+}
+
+function updateSummaryLegendToggle() {
+  els.summaryLegendToggle.setAttribute("aria-expanded", String(state.summaryLegendOpen));
+  els.summaryLegendToggle.classList.toggle("active", state.summaryLegendOpen);
+}
+
+function toggleSummaryLegend() {
+  state.summaryLegendOpen = !state.summaryLegendOpen;
+  els.summaryLegendPanel.classList.toggle("hidden", !state.summaryLegendOpen);
+  updateSummaryLegendToggle();
 }
 
 function nextDocumentSort(pageId) {
+  const metrics = selectedSummaryMetricIds();
+  if (!metrics.length) return { type: "aggregate", metric: "cerMedian", pageId: null, direction: "asc" };
   const samePage = state.homeSort.type === "page" && state.homeSort.pageId === pageId;
-  if (!samePage) return { type: "page", metric: "cer", pageId, direction: "asc" };
-  if (state.homeSort.metric === "cer" && state.homeSort.direction === "asc") {
-    return { type: "page", metric: "cer", pageId, direction: "desc" };
+  const currentIndex = metrics.indexOf(state.homeSort.metric);
+  if (!samePage || currentIndex === -1) return { type: "page", metric: metrics[0], pageId, direction: "asc" };
+  if (state.homeSort.direction === "asc") {
+    return { type: "page", metric: state.homeSort.metric, pageId, direction: "desc" };
   }
-  if (state.homeSort.metric === "cer" && state.homeSort.direction === "desc") {
-    return { type: "page", metric: "wer", pageId, direction: "asc" };
-  }
-  if (state.homeSort.metric === "wer" && state.homeSort.direction === "asc") {
-    return { type: "page", metric: "wer", pageId, direction: "desc" };
-  }
-  return { type: "page", metric: "cer", pageId, direction: "asc" };
+  return { type: "page", metric: metrics[(currentIndex + 1) % metrics.length], pageId, direction: "asc" };
 }
 
 function nextModelPageSort(modelId) {
+  const metrics = selectedSummaryMetricIds();
+  if (!metrics.length) return { type: "alpha", modelId: null, metric: "cer", direction: "asc" };
   const sameModel = state.homePageSort.type === "model" && state.homePageSort.modelId === modelId;
-  if (!sameModel) return { type: "model", modelId, metric: "cer", direction: "asc" };
-  if (state.homePageSort.metric === "cer" && state.homePageSort.direction === "asc") {
-    return { type: "model", modelId, metric: "cer", direction: "desc" };
+  const currentIndex = metrics.indexOf(state.homePageSort.metric);
+  if (!sameModel || currentIndex === -1) return { type: "model", modelId, metric: metrics[0], direction: "asc" };
+  if (state.homePageSort.direction === "asc") {
+    return { type: "model", modelId, metric: state.homePageSort.metric, direction: "desc" };
   }
-  if (state.homePageSort.metric === "cer" && state.homePageSort.direction === "desc") {
-    return { type: "model", modelId, metric: "wer", direction: "asc" };
-  }
-  if (state.homePageSort.metric === "wer" && state.homePageSort.direction === "asc") {
-    return { type: "model", modelId, metric: "wer", direction: "desc" };
-  }
-  return { type: "model", modelId, metric: "cer", direction: "asc" };
+  return { type: "model", modelId, metric: metrics[(currentIndex + 1) % metrics.length], direction: "asc" };
 }
 
 function modelAvailablePages(model) {
@@ -330,6 +613,43 @@ function normalizeForScoring(value) {
 
 function prepareScoringText(value) {
   return normalizeForScoring(cleanupReadingText(value));
+}
+
+function indexedScoringTextAvailable() {
+  return (
+    typeof state.currentPage?.groundTruthScoringText === "string" &&
+    typeof state.currentResult?.scoringTextContent === "string"
+  );
+}
+
+function displayedGtText() {
+  return state.textView === "raw" ? state.gtText : state.gtScoringText;
+}
+
+function displayedOcrText() {
+  return state.textView === "raw" ? state.ocrText : state.ocrScoringText;
+}
+
+function updateTextViewToggle() {
+  const rawActive = state.textView === "raw";
+  els.textViewToggles.forEach((toggle) => {
+    toggle.textContent = rawActive ? "Raw" : "Norm";
+    toggle.title = rawActive ? "Show normalized text panes" : "Show raw text panes";
+    toggle.setAttribute("aria-pressed", String(rawActive));
+  });
+}
+
+function renderTextPanes() {
+  els.groundTruthText.textContent = displayedGtText();
+  els.ocrText.textContent = displayedOcrText();
+  updateTextViewToggle();
+}
+
+function toggleTextView() {
+  const scrollPosition = getCurrentScrollPosition();
+  state.textView = state.textView === "raw" ? "normalized" : "raw";
+  renderTextPanes();
+  applySyncedScroll(scrollPosition);
 }
 
 function buildLevenshteinDiff(reference, hypothesis) {
@@ -570,14 +890,16 @@ function cerClass(value) {
 
 function renderHomeTable() {
   if (!state.index) return;
+  ensureVisibleSummarySorts();
+  updateSummaryColumnToggles();
+  updateSummaryLegendToggle();
   const models = homeModels();
   const pages = homePages();
-  const aggregateColumns = [
-    { metric: "cerMean", group: "CER", label: "Mean" },
-    { metric: "cerMedian", group: "CER", label: "Median" },
-    { metric: "werMean", group: "WER", label: "Mean" },
-    { metric: "werMedian", group: "WER", label: "Median" },
-  ];
+  const documentColumns = selectedSummaryMetrics();
+  const aggregateColumns = selectedAggregateColumns();
+  const documentColorScales = buildDocumentColorScales(documentColumns);
+  const aggregateColorScales = buildAggregateColorScales(models, aggregateColumns);
+  const docGroupWidth = Math.max(58, documentColumns.length * 58);
   const sortIndicator = (type, metric, pageId = null) => {
     const active =
       state.homeSort.type === type &&
@@ -590,11 +912,11 @@ function renderHomeTable() {
     if (state.homePageSort.type === "alpha") {
       return state.homePageSort.direction === "asc" ? " A-Z" : " Z-A";
     }
-    return `${state.homePageSort.metric.toUpperCase()} ${state.homePageSort.direction === "asc" ? "→" : "←"}`;
+    return `${summaryMetricLabel(state.homePageSort.metric)} ${state.homePageSort.direction === "asc" ? "→" : "←"}`;
   };
   const docGroupIndicator = (pageId) => {
     if (state.homeSort.type !== "page" || state.homeSort.pageId !== pageId) return "";
-    return ` ${state.homeSort.metric.toUpperCase()} ${state.homeSort.direction === "asc" ? "↑" : "↓"}`;
+    return ` ${summaryMetricLabel(state.homeSort.metric)} ${state.homeSort.direction === "asc" ? "↑" : "↓"}`;
   };
   const header = [
     `<tr>`,
@@ -602,18 +924,18 @@ function renderHomeTable() {
     `<button class="model-alpha-sort" type="button">Model${state.homeSort.type === "alpha" ? (state.homeSort.direction === "asc" ? " A-Z" : " Z-A") : ""}</button>` +
     `<span class="model-col-resizer" title="Resize model column" role="separator" aria-orientation="vertical"></span>` +
     `</th>`,
-    `<th class="metric-group" colspan="2">CER</th>`,
-    `<th class="metric-group" colspan="2">WER</th>`,
+    ...documentColumns.map((column) => `<th class="metric-group" colspan="2">${column.label}</th>`),
     ...pages.map((page) => {
       const active = state.homeSort.type === "page" && state.homeSort.pageId === page.id;
+      const style = `width:${docGroupWidth}px;min-width:${docGroupWidth}px;max-width:${docGroupWidth}px`;
       return (
-        `<th class="doc-group ${active ? "sorted" : ""}" colspan="2" title="${escapeHtml(`${page.id}: cycle CER/WER sort`)}">` +
+        `<th class="doc-group ${active ? "sorted" : ""}" colspan="${documentColumns.length}" style="${style}" title="${escapeHtml(`${page.id}: cycle selected metric sort`)}">` +
         `<button class="doc-group-sort" type="button" data-page="${escapeHtml(page.id)}">` +
         `${escapeHtml(page.id)}${docGroupIndicator(page.id)}` +
         `</button>` +
         `</th>`
       );
-    }),
+    }).filter(() => documentColumns.length > 0),
     `</tr>`,
     `<tr>`,
     ...aggregateColumns.map((column) => {
@@ -625,12 +947,12 @@ function renderHomeTable() {
       );
     }),
     ...pages.flatMap((page) => {
-      return ["cer", "wer"].map((metric) => {
-        const active = state.homeSort.type === "page" && state.homeSort.pageId === page.id && state.homeSort.metric === metric;
+      return documentColumns.map((column) => {
+        const active = state.homeSort.type === "page" && state.homeSort.pageId === page.id && state.homeSort.metric === column.id;
         return (
-          `<th class="doc-col ${active ? "sorted" : ""}" title="${escapeHtml(`${page.id} ${metric.toUpperCase()}`)}">` +
-          `<button class="doc-sort" type="button" data-page="${escapeHtml(page.id)}" data-metric="${metric}">` +
-          `${metric.toUpperCase()}${sortIndicator("page", metric, page.id)}` +
+          `<th class="doc-col ${active ? "sorted" : ""}" title="${escapeHtml(`${page.id} ${column.title}`)}">` +
+          `<button class="doc-sort" type="button" data-page="${escapeHtml(page.id)}" data-metric="${column.id}">` +
+          `${column.label}${sortIndicator("page", column.id, page.id)}` +
           `</button>` +
           `</th>`
         );
@@ -642,31 +964,37 @@ function renderHomeTable() {
   const body = models.map((model) => {
     const cells = pages.flatMap((page) => {
       const result = page.models[model.id];
-      if (!result) return [`<td class="metric-cell missing">-</td>`, `<td class="metric-cell missing">-</td>`];
-      const cer = resultCer(result);
-      const wer = resultWer(result);
-      const title = `${model.id} / ${page.id}\nCER ${formatPercent(cer)}\nWER ${formatPercent(wer)}`;
-      return [
-        `<td><button class="metric-link ${cerClass(cer)}" type="button" data-page="${escapeHtml(page.id)}" data-model="${escapeHtml(model.id)}" title="${escapeHtml(title)}">${formatCompactPercent(cer)}</button></td>`,
-        `<td><button class="metric-link ${cerClass(wer)}" type="button" data-page="${escapeHtml(page.id)}" data-model="${escapeHtml(model.id)}" title="${escapeHtml(title)}">${formatCompactPercent(wer)}</button></td>`,
-      ];
+      if (!result) return documentColumns.map(() => `<td class="metric-cell missing">-</td>`);
+      const title = summaryMetricTitle(model.id, page.id, result);
+      return documentColumns.map((column) => {
+        const value = resultMetric(result, column.id);
+        const colorValue = documentColorValue(result, column.id);
+        return (
+          `<td><button class="metric-link ${percentileMetricClass(column.id, colorValue, documentColorScales[column.id])}" type="button" data-page="${escapeHtml(page.id)}" data-model="${escapeHtml(model.id)}" title="${escapeHtml(title)}">` +
+          `${formatSummaryMetric(column.id, value)}` +
+          `</button></td>`
+        );
+      });
     }).join("");
     return (
       `<tr>` +
-      `<th class="sticky-col model-col" title="${escapeHtml(`Cycle document sort by ${model.id}: CER/WER`)}">` +
+      `<th class="sticky-col model-col" title="${escapeHtml(`Cycle document sort by ${model.id}: selected metrics`)}">` +
       `<button class="model-doc-sort" type="button" data-model="${escapeHtml(model.id)}">` +
       `${escapeHtml(model.id)}${state.homePageSort.type === "model" && state.homePageSort.modelId === model.id ? ` · ${pageSortIndicator()}` : ""}` +
       `</button>` +
       `</th>` +
-      `<td class="metric-col strong">${formatPercent(model.displayCerMean)}</td>` +
-      `<td class="metric-col">${formatPercent(model.displayCerMedian)}</td>` +
-      `<td class="metric-col strong">${formatPercent(model.displayWerMean)}</td>` +
-      `<td class="metric-col">${formatPercent(model.displayWerMedian)}</td>` +
+      aggregateColumns.map((column) => {
+        const value = modelSummaryMetric(model, column.metric);
+        const className = percentileMetricClass(column.sourceMetric, value, aggregateColorScales[column.metric]);
+        return `<td class="metric-col ${column.statistic === "mean" ? "strong" : ""} ${className}">${formatSummaryMetric(column.sourceMetric, value, false)}</td>`;
+      }).join("") +
       cells +
       `</tr>`
     );
   }).join("");
 
+  els.summaryLegendPanel.innerHTML = renderSummaryColorLegend(documentColumns, aggregateColumns, documentColorScales, aggregateColorScales);
+  els.summaryLegendPanel.classList.toggle("hidden", !state.summaryLegendOpen);
   els.summaryTable.innerHTML = `<thead>${header}</thead><tbody>${body}</tbody>`;
 }
 
@@ -718,38 +1046,43 @@ async function renderSelection(options = {}) {
         : await Promise.all([loadText(page.groundTruth), loadText(result.text)]);
     state.gtText = gtText;
     state.ocrText = ocrText;
-    els.groundTruthText.textContent = gtText;
-    els.ocrText.textContent = ocrText;
+    state.gtScoringText =
+      typeof page.groundTruthScoringText === "string" ? page.groundTruthScoringText : prepareScoringText(gtText);
+    state.ocrScoringText =
+      typeof result.scoringTextContent === "string" ? result.scoringTextContent : prepareScoringText(ocrText);
+    renderTextPanes();
     renderDiff();
     applySyncedScroll(scrollPosition || { topRatio: 0, leftRatio: 0 });
   } catch (error) {
     state.gtText = "";
     state.ocrText = "";
-    els.groundTruthText.textContent = "";
-    els.ocrText.textContent = "";
+    state.gtScoringText = "";
+    state.ocrScoringText = "";
+    renderTextPanes();
     els.diffText.textContent = "";
     showToast(`Could not load text: ${error.message}`);
   }
 }
 
 function renderDiff() {
-  const reference = prepareScoringText(state.gtText);
-  const hypothesis = prepareScoringText(state.ocrText);
+  const hasIndexedScoringText = indexedScoringTextAvailable();
+  const reference = hasIndexedScoringText ? state.gtScoringText : prepareScoringText(state.gtText);
+  const hypothesis = hasIndexedScoringText ? state.ocrScoringText : prepareScoringText(state.ocrText);
   if (state.diffCriterion === "wer") {
     const referenceWords = reference.split(/\s+/).filter(Boolean);
     const hypothesisWords = hypothesis.split(/\s+/).filter(Boolean);
-    const operations = state.currentResult?.wordOpcodes
+    const operations = hasIndexedScoringText && state.currentResult?.wordOpcodes
       ? wordOpcodesToOperations(referenceWords, hypothesisWords, state.currentResult.wordOpcodes)
       : buildLevenshteinSequenceDiff(referenceWords, hypothesisWords);
     const counts = countSequenceOperations(operations);
-    renderDiffSummary(state.currentResult?.wordOps || counts, counts, "word", true);
+    renderDiffSummary(hasIndexedScoringText ? state.currentResult?.wordOps || counts : counts, counts, "word", true);
     els.diffText.innerHTML = renderWordDiffOperations(operations);
     return;
   }
 
   const operations = buildLevenshteinDiff(reference, hypothesis);
   const counts = countOperations(operations);
-  renderDiffSummary(state.currentResult?.ops || counts, counts, "character", true);
+  renderDiffSummary(hasIndexedScoringText ? state.currentResult?.ops || counts : counts, counts, "character", true);
   els.diffText.innerHTML = renderDiffOperations(operations);
 }
 
@@ -1223,6 +1556,39 @@ function startSidebarResize(event) {
   window.addEventListener("pointercancel", stop);
 }
 
+function setSidebarPanelSplit(value) {
+  const clamped = clamp(value, 20, 80);
+  state.sidebarPanelSplit = clamped;
+  els.sidebarContent.style.setProperty("--sidebar-panel-split", `calc(${clamped}% - 4px)`);
+  els.sidebarPanelSplitter.setAttribute("aria-valuenow", String(Math.round(clamped)));
+  localStorage.setItem("ocrDiffSidebarPanelSplit", String(clamped));
+}
+
+function startSidebarPanelResize(event) {
+  event.preventDefault();
+  if (els.layout.classList.contains("sidebar-collapsed")) return;
+  document.body.classList.add("resizing-sidebar-panel");
+  event.currentTarget.setPointerCapture(event.pointerId);
+
+  const move = (moveEvent) => {
+    const rect = els.sidebarContent.getBoundingClientRect();
+    if (!rect.height) return;
+    const pct = ((moveEvent.clientY - rect.top) / rect.height) * 100;
+    setSidebarPanelSplit(pct);
+  };
+
+  const stop = () => {
+    document.body.classList.remove("resizing-sidebar-panel");
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", stop);
+    window.removeEventListener("pointercancel", stop);
+  };
+
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", stop);
+  window.addEventListener("pointercancel", stop);
+}
+
 function restoreGridSize() {
   const rawLeft = localStorage.getItem("ocrDiffGridLeft");
   const rawTop = localStorage.getItem("ocrDiffGridTop");
@@ -1248,6 +1614,12 @@ function restoreSidebarWidth() {
   const rawWidth = localStorage.getItem("ocrDiffSidebarWidth");
   const storedWidth = rawWidth === null ? NaN : Number(rawWidth);
   setSidebarWidth(Number.isFinite(storedWidth) ? storedWidth : state.sidebarWidth);
+}
+
+function restoreSidebarPanelSplit() {
+  const rawSplit = localStorage.getItem("ocrDiffSidebarPanelSplit");
+  const storedSplit = rawSplit === null ? NaN : Number(rawSplit);
+  setSidebarPanelSplit(Number.isFinite(storedSplit) ? storedSplit : state.sidebarPanelSplit);
 }
 
 function toggleSidebar() {
@@ -1325,6 +1697,10 @@ els.homeButton.addEventListener("click", () => {
 });
 els.homeDocSearch.addEventListener("input", renderHomeTable);
 els.homeModelSearch.addEventListener("input", renderHomeTable);
+els.summaryColumnToggles.forEach((toggle) => {
+  toggle.addEventListener("click", () => toggleSummaryColumn(toggle.dataset.summaryColumn));
+});
+els.summaryLegendToggle.addEventListener("click", toggleSummaryLegend);
 els.sortModelsAlpha.addEventListener("click", () => {
   const sameSort = state.homeSort.type === "alpha";
   state.homeSort = {
@@ -1421,6 +1797,7 @@ window.addEventListener("wheel", handleHorizontalWheelEdge, { passive: false, ca
 els.groundTruthText.addEventListener("scroll", () => syncTextScroll("gt"));
 els.ocrText.addEventListener("scroll", () => syncTextScroll("ocr"));
 els.diffText.addEventListener("scroll", () => syncTextScroll("diff"));
+els.textViewToggles.forEach((toggle) => toggle.addEventListener("click", toggleTextView));
 els.diffCriterionSelect.addEventListener("change", () => {
   state.diffCriterion = els.diffCriterionSelect.value;
   renderDiff();
@@ -1431,13 +1808,15 @@ els.verticalSplitter.addEventListener("pointerdown", (event) => startGridResize(
 els.horizontalSplitter.addEventListener("pointerdown", (event) => startGridResize("y", event));
 els.sidebarToggle.addEventListener("click", toggleSidebar);
 els.sidebarResizer.addEventListener("pointerdown", startSidebarResize);
+els.sidebarPanelSplitter.addEventListener("pointerdown", startSidebarPanelResize);
 document.getElementById("zoomOut").addEventListener("click", () => setZoom(state.zoom - 10));
 document.getElementById("zoomIn").addEventListener("click", () => setZoom(state.zoom + 10));
-document.getElementById("copyGt").addEventListener("click", () => copyText(state.gtText));
-document.getElementById("copyOcr").addEventListener("click", () => copyText(state.ocrText));
+document.getElementById("copyGt").addEventListener("click", () => copyText(displayedGtText()));
+document.getElementById("copyOcr").addEventListener("click", () => copyText(displayedOcrText()));
 
 setZoom(100);
 restoreGridSize();
 restoreSidebarWidth();
+restoreSidebarPanelSplit();
 restoreSummaryModelWidth();
 init();
