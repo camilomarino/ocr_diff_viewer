@@ -24,6 +24,14 @@ const state = {
   summaryLegendOpen: false,
   diffCriterion: "cer",
   appliedRouteHash: "",
+  mirrorSelection: { source: null, gt: [], ocr: [], diffRef: [], diffPred: [] },
+  selectionAlignmentCache: new Map(),
+  renderingMirrorSelection: false,
+  selectionFrame: 0,
+  diffRender: null,
+  diffReferenceText: "",
+  diffHypothesisText: "",
+  diffVisibleMap: [],
 };
 
 const horizontalBounceTimers = new WeakMap();
@@ -535,6 +543,163 @@ function unescapeHtml(value) {
   return textarea.value;
 }
 
+function emptyMirrorSelection() {
+  return { source: null, gt: [], ocr: [], diffRef: [], diffPred: [] };
+}
+
+function hasMirrorSelection(selection = state.mirrorSelection) {
+  return Boolean(
+    selection.source ||
+      selection.gt.length ||
+      selection.ocr.length ||
+      selection.diffRef.length ||
+      selection.diffPred.length
+  );
+}
+
+function clampRange(range, length) {
+  const start = clamp(Math.min(range.start, range.end), 0, length);
+  const end = clamp(Math.max(range.start, range.end), 0, length);
+  return { start, end };
+}
+
+function addRange(ranges, start, end) {
+  ranges.push({ start, end });
+}
+
+function mergeRanges(ranges, length = Number.POSITIVE_INFINITY) {
+  const normalized = ranges
+    .map((range) => clampRange(range, length))
+    .filter((range) => range.end > range.start)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged = [];
+  normalized.forEach((range) => {
+    const previous = merged[merged.length - 1];
+    if (previous && range.start <= previous.end) {
+      previous.end = Math.max(previous.end, range.end);
+    } else {
+      merged.push({ ...range });
+    }
+  });
+  return merged;
+}
+
+function rangesEqual(aRanges, bRanges) {
+  if (aRanges.length !== bRanges.length) return false;
+  return aRanges.every((range, index) => range.start === bRanges[index].start && range.end === bRanges[index].end);
+}
+
+function mirrorSelectionsEqual(a, b) {
+  return (
+    a.source === b.source &&
+    rangesEqual(a.gt, b.gt) &&
+    rangesEqual(a.ocr, b.ocr) &&
+    rangesEqual(a.diffRef, b.diffRef) &&
+    rangesEqual(a.diffPred, b.diffPred)
+  );
+}
+
+function rangeOverlaps(ranges, start, end) {
+  return ranges.some((range) => range.start < end && range.end > start);
+}
+
+function localizeRanges(ranges, baseStart, length) {
+  const baseEnd = baseStart + length;
+  return mergeRanges(
+    ranges
+      .map((range) => ({
+        start: Math.max(range.start, baseStart) - baseStart,
+        end: Math.min(range.end, baseEnd) - baseStart,
+      }))
+      .filter((range) => range.end > range.start),
+    length
+  );
+}
+
+function renderEscapedTextWithHighlights(value, ranges) {
+  const highlights = mergeRanges(ranges, value.length);
+  if (!highlights.length) return escapeHtml(value);
+
+  const parts = [];
+  let cursor = 0;
+  highlights.forEach((range) => {
+    if (range.start > cursor) {
+      parts.push(escapeHtml(value.slice(cursor, range.start)));
+    }
+    parts.push(`<mark class="selection-mirror">${escapeHtml(value.slice(range.start, range.end))}</mark>`);
+    cursor = range.end;
+  });
+  if (cursor < value.length) {
+    parts.push(escapeHtml(value.slice(cursor)));
+  }
+  return parts.join("");
+}
+
+function renderPlainTextWithHighlights(value, ranges) {
+  return renderEscapedTextWithHighlights(value, ranges);
+}
+
+function invalidateSelectionAlignmentCache() {
+  state.selectionAlignmentCache.clear();
+}
+
+function getAlignmentOperations(sourceLabel, sourceText, targetLabel, targetText) {
+  const key = `${sourceLabel}->${targetLabel}`;
+  const cached = state.selectionAlignmentCache.get(key);
+  if (cached && cached.sourceText === sourceText && cached.targetText === targetText) {
+    return cached.operations;
+  }
+  const operations = buildLevenshteinDiff(sourceText, targetText);
+  state.selectionAlignmentCache.set(key, { sourceText, targetText, operations });
+  return operations;
+}
+
+function mapRangeThroughOperations(operations, range) {
+  const mapped = [];
+  let sourceCursor = 0;
+  let targetCursor = 0;
+  operations.forEach((operation) => {
+    const sourceLength = operation.ref.length;
+    const targetLength = operation.pred.length;
+    const sourceStart = sourceCursor;
+    const sourceEnd = sourceStart + sourceLength;
+    const targetStart = targetCursor;
+
+    const overlapStart = Math.max(range.start, sourceStart);
+    const overlapEnd = Math.min(range.end, sourceEnd);
+    if (overlapEnd > overlapStart && targetLength > 0) {
+      if (sourceLength === targetLength) {
+        addRange(mapped, targetStart + overlapStart - sourceStart, targetStart + overlapEnd - sourceStart);
+      } else if (sourceLength > 0) {
+        const localStart = overlapStart - sourceStart;
+        const localEnd = overlapEnd - sourceStart;
+        addRange(
+          mapped,
+          targetStart + Math.floor((localStart / sourceLength) * targetLength),
+          targetStart + Math.ceil((localEnd / sourceLength) * targetLength)
+        );
+      }
+    }
+
+    sourceCursor += sourceLength;
+    targetCursor += targetLength;
+  });
+  return mapped;
+}
+
+function mapRangesBetween(sourceLabel, sourceText, targetLabel, targetText, ranges) {
+  const normalized = mergeRanges(ranges, sourceText.length);
+  if (!normalized.length || !targetText.length) return [];
+  if (sourceText === targetText) {
+    return mergeRanges(normalized, targetText.length);
+  }
+  const operations = getAlignmentOperations(sourceLabel, sourceText, targetLabel, targetText);
+  return mergeRanges(
+    normalized.flatMap((range) => mapRangeThroughOperations(operations, range)),
+    targetText.length
+  );
+}
+
 function stripMarkdownTableSeparators(value) {
   return value
     .split(/\r?\n/)
@@ -639,15 +804,28 @@ function updateTextViewToggle() {
   });
 }
 
+function paneMirrorRanges(paneName) {
+  if (state.mirrorSelection.source === paneName) return [];
+  return paneName === "gt" ? state.mirrorSelection.gt : state.mirrorSelection.ocr;
+}
+
+function renderTextPane(paneName) {
+  const element = paneName === "gt" ? els.groundTruthText : els.ocrText;
+  const text = paneName === "gt" ? displayedGtText() : displayedOcrText();
+  element.innerHTML = renderPlainTextWithHighlights(text, paneMirrorRanges(paneName));
+}
+
 function renderTextPanes() {
-  els.groundTruthText.textContent = displayedGtText();
-  els.ocrText.textContent = displayedOcrText();
+  renderTextPane("gt");
+  renderTextPane("ocr");
   updateTextViewToggle();
 }
 
 function toggleTextView() {
   const scrollPosition = getCurrentScrollPosition();
   state.textView = state.textView === "raw" ? "normalized" : "raw";
+  clearMirrorSelection({ render: false });
+  invalidateSelectionAlignmentCache();
   renderTextPanes();
   applySyncedScroll(scrollPosition);
 }
@@ -1031,6 +1209,8 @@ async function renderSelection(options = {}) {
   const result = page?.models[state.currentModel];
   if (!page || !result) return;
   const scrollPosition = options.preserveScroll ? getCurrentScrollPosition() : null;
+  clearMirrorSelection({ render: false });
+  invalidateSelectionAlignmentCache();
   state.currentResult = result;
 
   els.pageTitle.textContent = page.id;
@@ -1058,6 +1238,10 @@ async function renderSelection(options = {}) {
     state.ocrText = "";
     state.gtScoringText = "";
     state.ocrScoringText = "";
+    state.diffRender = null;
+    state.diffReferenceText = "";
+    state.diffHypothesisText = "";
+    state.diffVisibleMap = [];
     renderTextPanes();
     els.diffText.textContent = "";
     showToast(`Could not load text: ${error.message}`);
@@ -1068,22 +1252,50 @@ function renderDiff() {
   const hasIndexedScoringText = indexedScoringTextAvailable();
   const reference = hasIndexedScoringText ? state.gtScoringText : prepareScoringText(state.gtText);
   const hypothesis = hasIndexedScoringText ? state.ocrScoringText : prepareScoringText(state.ocrText);
+  state.diffReferenceText = reference;
+  state.diffHypothesisText = hypothesis;
+  invalidateSelectionAlignmentCache();
+
   if (state.diffCriterion === "wer") {
-    const referenceWords = reference.split(/\s+/).filter(Boolean);
-    const hypothesisWords = hypothesis.split(/\s+/).filter(Boolean);
+    const referenceTokens = splitWordsWithOffsets(reference);
+    const hypothesisTokens = splitWordsWithOffsets(hypothesis);
+    const referenceWords = referenceTokens.map((token) => token.text);
+    const hypothesisWords = hypothesisTokens.map((token) => token.text);
     const operations = hasIndexedScoringText && state.currentResult?.wordOpcodes
       ? wordOpcodesToOperations(referenceWords, hypothesisWords, state.currentResult.wordOpcodes)
       : buildLevenshteinSequenceDiff(referenceWords, hypothesisWords);
     const counts = countSequenceOperations(operations);
     renderDiffSummary(hasIndexedScoringText ? state.currentResult?.wordOps || counts : counts, counts, "word", true);
-    els.diffText.innerHTML = renderWordDiffOperations(operations);
+    state.diffRender = { criterion: "wer", operations, reference, hypothesis, referenceTokens, hypothesisTokens };
+    renderDiffBody();
     return;
   }
 
   const operations = buildLevenshteinDiff(reference, hypothesis);
   const counts = countOperations(operations);
   renderDiffSummary(hasIndexedScoringText ? state.currentResult?.ops || counts : counts, counts, "character", true);
-  els.diffText.innerHTML = renderDiffOperations(operations);
+  state.diffRender = { criterion: "cer", operations, reference, hypothesis };
+  renderDiffBody();
+}
+
+function splitWordsWithOffsets(value) {
+  const tokens = [];
+  for (const match of value.matchAll(/\S+/g)) {
+    tokens.push({ text: match[0], start: match.index, end: match.index + match[0].length });
+  }
+  return tokens;
+}
+
+function renderDiffBody() {
+  state.diffVisibleMap = [];
+  if (!state.diffRender) {
+    els.diffText.textContent = "";
+    return;
+  }
+  els.diffText.innerHTML =
+    state.diffRender.criterion === "wer"
+      ? renderWordDiffOperations(state.diffRender)
+      : renderDiffOperations(state.diffRender.operations);
 }
 
 function buildLevenshteinSequenceDiff(reference, hypothesis) {
@@ -1242,97 +1454,243 @@ function renderDiffSummary(indexOps, renderedOps, unit, checkMismatch) {
     : `Levenshtein operations used for ${criterion}`;
 }
 
-function renderDiffOperations(operations) {
-  return operations.map((operation) => {
-    if (operation.type === "equal") {
-      return `<span class="diff-segment diff-eq">${escapeHtml(operation.ref)}</span>`;
-    }
-    if (operation.type === "delete") {
-      return `<del class="diff-segment diff-del">${renderChangedText(operation.ref)}</del>`;
-    }
-    if (operation.type === "insert") {
-      return `<ins class="diff-segment diff-ins">${renderChangedText(operation.pred)}</ins>`;
-    }
-    return renderReplacementOperation(operation.ref, operation.pred);
-  }).join("");
+function diffRefMirrorRanges() {
+  return state.mirrorSelection.source === "diff" ? [] : state.mirrorSelection.diffRef;
 }
 
-function renderWordDiffOperations(operations) {
-  return operations.map((operation) => {
-    if (operation.type === "equal") {
-      return `<span class="diff-segment diff-eq">${renderWordText(operation.ref)}</span>`;
-    }
-    if (operation.type === "delete") {
-      return `<del class="diff-segment diff-del">${renderWordText(operation.ref)}</del>`;
-    }
-    if (operation.type === "insert") {
-      return `<ins class="diff-segment diff-ins">${renderWordText(operation.pred)}</ins>`;
-    }
-    return renderWordReplacementOperation(operation.ref, operation.pred);
-  }).filter(Boolean).join(" ");
+function diffPredMirrorRanges() {
+  return state.mirrorSelection.source === "diff" ? [] : state.mirrorSelection.diffPred;
 }
 
-function renderWordReplacementOperation(reference, hypothesis) {
-  const sharedLength = Math.min(reference.length, hypothesis.length);
-  const substitutionRef = reference.slice(0, sharedLength);
-  const substitutionPred = hypothesis.slice(0, sharedLength);
-  const deletedExtra = reference.slice(sharedLength);
-  const insertedExtra = hypothesis.slice(sharedLength);
+function appendDiffVisibleEntry(refOffset = null, predOffset = null) {
+  const entry = {};
+  if (typeof refOffset === "number") {
+    entry.refStart = refOffset;
+    entry.refEnd = refOffset + 1;
+  }
+  if (typeof predOffset === "number") {
+    entry.predStart = predOffset;
+    entry.predEnd = predOffset + 1;
+  }
+  state.diffVisibleMap.push(entry);
+}
+
+function appendUnmappedDiffVisibleChars(count) {
+  for (let index = 0; index < count; index += 1) {
+    state.diffVisibleMap.push({});
+  }
+}
+
+function renderEqualDiffText(value, refStart, predStart) {
+  for (let index = 0; index < value.length; index += 1) {
+    appendDiffVisibleEntry(refStart + index, predStart + index);
+  }
+  const localRanges = mergeRanges([
+    ...localizeRanges(diffRefMirrorRanges(), refStart, value.length),
+    ...localizeRanges(diffPredMirrorRanges(), predStart, value.length),
+  ], value.length);
+  return renderEscapedTextWithHighlights(value, localRanges);
+}
+
+function changedCharHtml(char) {
+  if (char === " ") return `<span class="diff-space" title="space">·</span>`;
+  if (char === "\n") return `<span class="diff-newline" title="line break">↵</span>\n`;
+  if (char === "\t") return `<span class="diff-space" title="tab">→</span>`;
+  return escapeHtml(char);
+}
+
+function changedCharVisibleLength(char) {
+  return char === "\n" ? 2 : 1;
+}
+
+function renderChangedTextWithHighlights(value, baseStart, paneName) {
+  const ranges = paneName === "ref" ? diffRefMirrorRanges() : diffPredMirrorRanges();
   const parts = [];
-
-  if (sharedLength > 0) {
-    parts.push(
-      `<span class="diff-segment diff-mod">` +
-      `<del class="diff-mod-ref">${renderWordText(substitutionRef)}</del>` +
-      `<ins class="diff-mod-pred">${renderWordText(substitutionPred)}</ins>` +
-      `</span>`
-    );
-  }
-  if (deletedExtra.length) {
-    parts.push(`<del class="diff-segment diff-del">${renderWordText(deletedExtra)}</del>`);
-  }
-  if (insertedExtra.length) {
-    parts.push(`<ins class="diff-segment diff-ins">${renderWordText(insertedExtra)}</ins>`);
-  }
-  return parts.join(" ");
-}
-
-function renderWordText(words) {
-  return words.map((word) => escapeHtml(word)).join(" ");
-}
-
-function renderReplacementOperation(reference, hypothesis) {
-  const sharedLength = Math.min(reference.length, hypothesis.length);
-  const substitutionRef = reference.slice(0, sharedLength);
-  const substitutionPred = hypothesis.slice(0, sharedLength);
-  const deletedExtra = reference.slice(sharedLength);
-  const insertedExtra = hypothesis.slice(sharedLength);
-  const parts = [];
-
-  if (sharedLength > 0) {
-    parts.push(
-      `<span class="diff-segment diff-mod">` +
-      `<del class="diff-mod-ref">${renderChangedText(substitutionRef)}</del>` +
-      `<ins class="diff-mod-pred">${renderChangedText(substitutionPred)}</ins>` +
-      `</span>`
-    );
-  }
-  if (deletedExtra) {
-    parts.push(`<del class="diff-segment diff-del">${renderChangedText(deletedExtra)}</del>`);
-  }
-  if (insertedExtra) {
-    parts.push(`<ins class="diff-segment diff-ins">${renderChangedText(insertedExtra)}</ins>`);
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value.charAt(index);
+    const highlighted = rangeOverlaps(ranges, baseStart + index, baseStart + index + 1);
+    const html = changedCharHtml(char);
+    const visibleLength = changedCharVisibleLength(char);
+    for (let visibleIndex = 0; visibleIndex < visibleLength; visibleIndex += 1) {
+      appendDiffVisibleEntry(paneName === "ref" ? baseStart + index : null, paneName === "pred" ? baseStart + index : null);
+    }
+    parts.push(highlighted ? `<mark class="selection-mirror">${html}</mark>` : html);
   }
   return parts.join("");
 }
 
-function renderChangedText(value) {
-  return Array.from(value).map((char) => {
-    if (char === " ") return `<span class="diff-space" title="space">·</span>`;
-    if (char === "\n") return `<span class="diff-newline" title="line break">↵</span>\n`;
-    if (char === "\t") return `<span class="diff-space" title="tab">→</span>`;
-    return escapeHtml(char);
+function renderDiffOperations(operations) {
+  let refCursor = 0;
+  let predCursor = 0;
+  return operations.map((operation) => {
+    const refStart = refCursor;
+    const predStart = predCursor;
+    refCursor += operation.ref.length;
+    predCursor += operation.pred.length;
+
+    if (operation.type === "equal") {
+      return `<span class="diff-segment diff-eq">${renderEqualDiffText(operation.ref, refStart, predStart)}</span>`;
+    }
+    if (operation.type === "delete") {
+      return `<del class="diff-segment diff-del">${renderChangedTextWithHighlights(operation.ref, refStart, "ref")}</del>`;
+    }
+    if (operation.type === "insert") {
+      return `<ins class="diff-segment diff-ins">${renderChangedTextWithHighlights(operation.pred, predStart, "pred")}</ins>`;
+    }
+    return renderReplacementOperation(operation.ref, operation.pred, refStart, predStart);
   }).join("");
+}
+
+function appendWordPart(parts, html) {
+  if (!html) return;
+  if (parts.length) {
+    parts.push(" ");
+    appendUnmappedDiffVisibleChars(1);
+  }
+  parts.push(html);
+}
+
+function renderWordTokenChars(token, paneName) {
+  const ranges = paneName === "ref" ? diffRefMirrorRanges() : diffPredMirrorRanges();
+  const parts = [];
+  for (let index = 0; index < token.text.length; index += 1) {
+    const offset = token.start + index;
+    const highlighted = rangeOverlaps(ranges, offset, offset + 1);
+    appendDiffVisibleEntry(paneName === "ref" ? offset : null, paneName === "pred" ? offset : null);
+    const html = escapeHtml(token.text.charAt(index));
+    parts.push(highlighted ? `<mark class="selection-mirror">${html}</mark>` : html);
+  }
+  return parts.join("");
+}
+
+function renderEqualWordTokenChars(refToken, predToken) {
+  const length = Math.max(refToken?.text.length || 0, predToken?.text.length || 0);
+  const parts = [];
+  for (let index = 0; index < length; index += 1) {
+    const char = (refToken?.text || predToken?.text || "").charAt(index);
+    if (!char) continue;
+    const refOffset = refToken && index < refToken.text.length ? refToken.start + index : null;
+    const predOffset = predToken && index < predToken.text.length ? predToken.start + index : null;
+    const highlighted =
+      (typeof refOffset === "number" && rangeOverlaps(diffRefMirrorRanges(), refOffset, refOffset + 1)) ||
+      (typeof predOffset === "number" && rangeOverlaps(diffPredMirrorRanges(), predOffset, predOffset + 1));
+    appendDiffVisibleEntry(refOffset, predOffset);
+    const html = escapeHtml(char);
+    parts.push(highlighted ? `<mark class="selection-mirror">${html}</mark>` : html);
+  }
+  return parts.join("");
+}
+
+function renderWordTokensWithHighlights(tokens, paneName) {
+  const parts = [];
+  tokens.forEach((token, index) => {
+    if (index > 0) {
+      parts.push(" ");
+      appendUnmappedDiffVisibleChars(1);
+    }
+    parts.push(renderWordTokenChars(token, paneName));
+  });
+  return parts.join("");
+}
+
+function renderEqualWordTokensWithHighlights(refTokens, predTokens) {
+  const parts = [];
+  const length = Math.max(refTokens.length, predTokens.length);
+  for (let index = 0; index < length; index += 1) {
+    if (index > 0) {
+      parts.push(" ");
+      appendUnmappedDiffVisibleChars(1);
+    }
+    parts.push(renderEqualWordTokenChars(refTokens[index], predTokens[index]));
+  }
+  return parts.join("");
+}
+
+function renderWordDiffOperations(renderData) {
+  let refCursor = 0;
+  let predCursor = 0;
+  const parts = [];
+
+  renderData.operations.forEach((operation) => {
+    const refTokens = renderData.referenceTokens.slice(refCursor, refCursor + operation.ref.length);
+    const predTokens = renderData.hypothesisTokens.slice(predCursor, predCursor + operation.pred.length);
+    refCursor += operation.ref.length;
+    predCursor += operation.pred.length;
+
+    if (operation.type === "equal") {
+      appendWordPart(parts, `<span class="diff-segment diff-eq">${renderEqualWordTokensWithHighlights(refTokens, predTokens)}</span>`);
+      return;
+    }
+    if (operation.type === "delete") {
+      appendWordPart(parts, `<del class="diff-segment diff-del">${renderWordTokensWithHighlights(refTokens, "ref")}</del>`);
+      return;
+    }
+    if (operation.type === "insert") {
+      appendWordPart(parts, `<ins class="diff-segment diff-ins">${renderWordTokensWithHighlights(predTokens, "pred")}</ins>`);
+      return;
+    }
+    appendWordPart(parts, renderWordReplacementOperation(refTokens, predTokens));
+  });
+
+  return parts.join("");
+}
+
+function renderWordReplacementOperation(refTokens, predTokens) {
+  const sharedLength = Math.min(refTokens.length, predTokens.length);
+  const substitutionRef = refTokens.slice(0, sharedLength);
+  const substitutionPred = predTokens.slice(0, sharedLength);
+  const deletedExtra = refTokens.slice(sharedLength);
+  const insertedExtra = predTokens.slice(sharedLength);
+  const parts = [];
+  const appendPart = (html) => {
+    if (!html) return;
+    if (parts.length) {
+      parts.push(" ");
+      appendUnmappedDiffVisibleChars(1);
+    }
+    parts.push(html);
+  };
+
+  if (sharedLength > 0) {
+    appendPart(
+      `<span class="diff-segment diff-mod">` +
+      `<del class="diff-mod-ref">${renderWordTokensWithHighlights(substitutionRef, "ref")}</del>` +
+      `<ins class="diff-mod-pred">${renderWordTokensWithHighlights(substitutionPred, "pred")}</ins>` +
+      `</span>`
+    );
+  }
+  if (deletedExtra.length) {
+    appendPart(`<del class="diff-segment diff-del">${renderWordTokensWithHighlights(deletedExtra, "ref")}</del>`);
+  }
+  if (insertedExtra.length) {
+    appendPart(`<ins class="diff-segment diff-ins">${renderWordTokensWithHighlights(insertedExtra, "pred")}</ins>`);
+  }
+  return parts.join("");
+}
+
+function renderReplacementOperation(reference, hypothesis, refStart, predStart) {
+  const sharedLength = Math.min(reference.length, hypothesis.length);
+  const substitutionRef = reference.slice(0, sharedLength);
+  const substitutionPred = hypothesis.slice(0, sharedLength);
+  const deletedExtra = reference.slice(sharedLength);
+  const insertedExtra = hypothesis.slice(sharedLength);
+  const parts = [];
+
+  if (sharedLength > 0) {
+    parts.push(
+      `<span class="diff-segment diff-mod">` +
+      `<del class="diff-mod-ref">${renderChangedTextWithHighlights(substitutionRef, refStart, "ref")}</del>` +
+      `<ins class="diff-mod-pred">${renderChangedTextWithHighlights(substitutionPred, predStart, "pred")}</ins>` +
+      `</span>`
+    );
+  }
+  if (deletedExtra) {
+    parts.push(`<del class="diff-segment diff-del">${renderChangedTextWithHighlights(deletedExtra, refStart + sharedLength, "ref")}</del>`);
+  }
+  if (insertedExtra) {
+    parts.push(`<ins class="diff-segment diff-ins">${renderChangedTextWithHighlights(insertedExtra, predStart + sharedLength, "pred")}</ins>`);
+  }
+  return parts.join("");
 }
 
 function clamp(value, min, max) {
@@ -1422,6 +1780,229 @@ function syncTextScroll(sourceName) {
   if (!sourceElement) return;
   state.scrollSource = sourceName;
   applySyncedScroll(getScrollPosition(sourceElement), sourceElement);
+}
+
+function snapshotScrollPanes() {
+  return Object.fromEntries(
+    Object.entries(scrollPanes()).map(([name, element]) => [
+      name,
+      { top: element.scrollTop, left: element.scrollLeft },
+    ])
+  );
+}
+
+function restoreScrollPanes(snapshot) {
+  Object.entries(scrollPanes()).forEach(([name, element]) => {
+    const position = snapshot[name];
+    if (!position) return;
+    element.scrollTop = position.top;
+    element.scrollLeft = position.left;
+  });
+}
+
+function mirrorSelectionHasPaneHighlights(selection, paneName) {
+  if (paneName === "gt") return selection.source !== "gt" && selection.gt.length > 0;
+  if (paneName === "ocr") return selection.source !== "ocr" && selection.ocr.length > 0;
+  return selection.source !== "diff" && (selection.diffRef.length > 0 || selection.diffPred.length > 0);
+}
+
+function textPositionInContainer(container, offset) {
+  const targetOffset = clamp(offset, 0, container.textContent.length);
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  let remaining = targetOffset;
+  let lastNode = null;
+  let node = walker.nextNode();
+  while (node) {
+    lastNode = node;
+    if (remaining <= node.textContent.length) {
+      return { node, offset: remaining };
+    }
+    remaining -= node.textContent.length;
+    node = walker.nextNode();
+  }
+  return lastNode
+    ? { node: lastNode, offset: lastNode.textContent.length }
+    : { node: container, offset: 0 };
+}
+
+function restoreNativeSelection(paneName, range) {
+  const container = scrollPanes()[paneName];
+  if (!container) return;
+  const selectedRange = clampRange(range, container.textContent.length);
+  if (selectedRange.end <= selectedRange.start) return;
+  const start = textPositionInContainer(container, selectedRange.start);
+  const end = textPositionInContainer(container, selectedRange.end);
+  const restoredRange = document.createRange();
+  restoredRange.setStart(start.node, start.offset);
+  restoredRange.setEnd(end.node, end.offset);
+  const selection = document.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(restoredRange);
+}
+
+function renderMirrorSelection(sourceName, options = {}) {
+  const scrollSnapshot = snapshotScrollPanes();
+  state.renderingMirrorSelection = true;
+
+  if (sourceName !== "gt" || options.refreshSource) renderTextPane("gt");
+  if (sourceName !== "ocr" || options.refreshSource) renderTextPane("ocr");
+  if (sourceName !== "diff" || options.refreshSource) renderDiffBody();
+
+  if (options.refreshSource && options.sourceRange) {
+    restoreNativeSelection(sourceName, options.sourceRange);
+  }
+
+  restoreScrollPanes(scrollSnapshot);
+  window.requestAnimationFrame(() => {
+    state.renderingMirrorSelection = false;
+  });
+}
+
+function clearMirrorSelection(options = {}) {
+  if (!hasMirrorSelection()) return;
+  state.mirrorSelection = emptyMirrorSelection();
+  if (options.render !== false) {
+    renderMirrorSelection(null);
+  }
+}
+
+function paneNameFromNode(node) {
+  if (!node) return null;
+  if (els.groundTruthText.contains(node)) return "gt";
+  if (els.ocrText.contains(node)) return "ocr";
+  if (els.diffText.contains(node)) return "diff";
+  return null;
+}
+
+function selectedPaneName(selection) {
+  const anchorPane = paneNameFromNode(selection.anchorNode);
+  const focusPane = paneNameFromNode(selection.focusNode);
+  return anchorPane && anchorPane === focusPane ? anchorPane : null;
+}
+
+function textOffsetInContainer(container, node, offset) {
+  const range = document.createRange();
+  range.setStart(container, 0);
+  range.setEnd(node, offset);
+  return range.toString().length;
+}
+
+function selectedTextRangeInPane(paneName) {
+  const selection = document.getSelection();
+  const container = scrollPanes()[paneName];
+  if (!selection || !container || !selection.rangeCount || selection.isCollapsed) return null;
+  const range = selection.getRangeAt(0);
+  if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) return null;
+  const selectedRange = clampRange(
+    {
+      start: textOffsetInContainer(container, range.startContainer, range.startOffset),
+      end: textOffsetInContainer(container, range.endContainer, range.endOffset),
+    },
+    container.textContent.length
+  );
+  return selectedRange.end > selectedRange.start ? selectedRange : null;
+}
+
+function mapDiffVisibleRangeToSourceRanges(range) {
+  const visibleRange = clampRange(range, state.diffVisibleMap.length);
+  const refRanges = [];
+  const predRanges = [];
+  for (let index = visibleRange.start; index < visibleRange.end; index += 1) {
+    const entry = state.diffVisibleMap[index];
+    if (!entry) continue;
+    if (typeof entry.refStart === "number" && typeof entry.refEnd === "number") {
+      addRange(refRanges, entry.refStart, entry.refEnd);
+    }
+    if (typeof entry.predStart === "number" && typeof entry.predEnd === "number") {
+      addRange(predRanges, entry.predStart, entry.predEnd);
+    }
+  }
+  return {
+    ref: mergeRanges(refRanges, state.diffReferenceText.length),
+    pred: mergeRanges(predRanges, state.diffHypothesisText.length),
+  };
+}
+
+function buildMirrorSelection(sourceName, range) {
+  const gtDisplay = displayedGtText();
+  const ocrDisplay = displayedOcrText();
+  const diffRef = state.diffReferenceText;
+  const diffPred = state.diffHypothesisText;
+
+  if (sourceName === "gt") {
+    const gtRanges = mergeRanges([range], gtDisplay.length);
+    const diffRefRanges = mapRangesBetween("gt-display", gtDisplay, "diff-ref", diffRef, gtRanges);
+    return {
+      source: "gt",
+      gt: gtRanges,
+      ocr: mapRangesBetween("gt-display", gtDisplay, "ocr-display", ocrDisplay, gtRanges),
+      diffRef: diffRefRanges,
+      diffPred: mapRangesBetween("diff-ref", diffRef, "diff-pred", diffPred, diffRefRanges),
+    };
+  }
+
+  if (sourceName === "ocr") {
+    const ocrRanges = mergeRanges([range], ocrDisplay.length);
+    const diffPredRanges = mapRangesBetween("ocr-display", ocrDisplay, "diff-pred", diffPred, ocrRanges);
+    return {
+      source: "ocr",
+      gt: mapRangesBetween("ocr-display", ocrDisplay, "gt-display", gtDisplay, ocrRanges),
+      ocr: ocrRanges,
+      diffRef: mapRangesBetween("diff-pred", diffPred, "diff-ref", diffRef, diffPredRanges),
+      diffPred: diffPredRanges,
+    };
+  }
+
+  const selectedDiff = mapDiffVisibleRangeToSourceRanges(range);
+  const refFromPred = mapRangesBetween("diff-pred", diffPred, "diff-ref", diffRef, selectedDiff.pred);
+  const predFromRef = mapRangesBetween("diff-ref", diffRef, "diff-pred", diffPred, selectedDiff.ref);
+  const combinedRef = mergeRanges([...selectedDiff.ref, ...refFromPred], diffRef.length);
+  const combinedPred = mergeRanges([...selectedDiff.pred, ...predFromRef], diffPred.length);
+
+  return {
+    source: "diff",
+    gt: mapRangesBetween("diff-ref", diffRef, "gt-display", gtDisplay, combinedRef),
+    ocr: mapRangesBetween("diff-pred", diffPred, "ocr-display", ocrDisplay, combinedPred),
+    diffRef: selectedDiff.ref,
+    diffPred: selectedDiff.pred,
+  };
+}
+
+function applyMirrorSelection(selection, sourceRange) {
+  if (mirrorSelectionsEqual(state.mirrorSelection, selection)) return;
+  const refreshSource = mirrorSelectionHasPaneHighlights(state.mirrorSelection, selection.source);
+  state.mirrorSelection = selection;
+  renderMirrorSelection(selection.source, { refreshSource, sourceRange });
+}
+
+function syncTextSelection() {
+  state.selectionFrame = 0;
+  if (state.renderingMirrorSelection) return;
+
+  const selection = document.getSelection();
+  if (!selection || !selection.rangeCount || selection.isCollapsed) {
+    clearMirrorSelection();
+    return;
+  }
+
+  const sourceName = selectedPaneName(selection);
+  if (!sourceName) {
+    clearMirrorSelection();
+    return;
+  }
+
+  const selectedRange = selectedTextRangeInPane(sourceName);
+  if (!selectedRange) {
+    clearMirrorSelection();
+    return;
+  }
+
+  applyMirrorSelection(buildMirrorSelection(sourceName, selectedRange), selectedRange);
+}
+
+function scheduleTextSelectionSync() {
+  if (state.renderingMirrorSelection || state.selectionFrame) return;
+  state.selectionFrame = window.requestAnimationFrame(syncTextSelection);
 }
 
 function nearestHorizontalScroller(target) {
@@ -1794,6 +2375,7 @@ els.summaryTable.addEventListener("pointerdown", (event) => {
 window.addEventListener("popstate", applyRoute);
 window.addEventListener("hashchange", applyRoute);
 window.addEventListener("wheel", handleHorizontalWheelEdge, { passive: false, capture: true });
+document.addEventListener("selectionchange", scheduleTextSelectionSync);
 els.groundTruthText.addEventListener("scroll", () => syncTextScroll("gt"));
 els.ocrText.addEventListener("scroll", () => syncTextScroll("ocr"));
 els.diffText.addEventListener("scroll", () => syncTextScroll("diff"));
